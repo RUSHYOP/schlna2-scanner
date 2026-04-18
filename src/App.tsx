@@ -3,6 +3,8 @@ import { Html5Qrcode } from "html5-qrcode";
 
 const API_URL = import.meta.env.VITE_API_URL || "https://api.saividyafest.live";
 const SCAN_CUTOFF = Date.UTC(2026, 3, 18, 9, 30, 0); // April 18, 2026, 3:00 PM IST
+const CACHE_TTL = 5 * 60 * 1000; // 5 minutes cache for pass data
+const FETCH_TIMEOUT = 15000; // 15 second timeout for API calls (increased for crowd)
 
 interface PassData {
   valid: boolean;
@@ -21,6 +23,11 @@ interface PassData {
   createdAt: string;
 }
 
+interface CachedPass {
+  data: PassData;
+  timestamp: number;
+}
+
 interface ScanResult {
   dryRun: boolean;
   firstScan: boolean;
@@ -28,6 +35,30 @@ interface ScanResult {
 }
 
 type ScanState = "scanning" | "loading" | "result" | "error";
+
+// In-memory cache for recently scanned passes (shared across re-renders)
+const passCache = new Map<string, CachedPass>();
+
+// Fetch with timeout and retry for reliability under load
+async function fetchWithRetry(url: string, options: RequestInit = {}, timeout = FETCH_TIMEOUT, retries = 2): Promise<Response> {
+  let lastError: Error | null = null;
+  for (let i = 0; i <= retries; i++) {
+    const controller = new AbortController();
+    const id = setTimeout(() => controller.abort(), timeout);
+    try {
+      const response = await fetch(url, { ...options, signal: controller.signal });
+      clearTimeout(id);
+      return response;
+    } catch (err) {
+      clearTimeout(id);
+      lastError = err as Error;
+      if (i < retries) {
+        await new Promise(r => setTimeout(r, 500 * (i + 1))); // backoff: 500ms, 1000ms
+      }
+    }
+  }
+  throw lastError;
+}
 
 export default function App() {
   const [state, setState] = useState<ScanState>("scanning");
@@ -64,8 +95,21 @@ export default function App() {
 
   const fetchPassData = useCallback(async (passCode: string) => {
     setState("loading");
+    
+    // Check cache first for faster response
+    const cached = passCache.get(passCode);
+    if (cached && Date.now() - cached.timestamp < CACHE_TTL) {
+      setPassData(cached.data);
+      // Still record scan even for cached data
+      fetchWithRetry(`${API_URL}/api/scan/${passCode}`, { method: "POST" })
+        .then(async (scanRes) => { if (scanRes.ok) setScanResult(await scanRes.json()); })
+        .catch(() => {});
+      setState("result");
+      return;
+    }
+    
     try {
-      const res = await fetch(`${API_URL}/api/verify/${passCode}/json`);
+      const res = await fetchWithRetry(`${API_URL}/api/verify/${passCode}/json`);
       if (!res.ok) {
         setErrorMsg(res.status === 404 ? "Pass not found — invalid or revoked" : "Server error");
         setState("error");
@@ -77,51 +121,70 @@ export default function App() {
         setState("error");
         return;
       }
+      
+      // Cache the pass data
+      passCache.set(passCode, { data, timestamp: Date.now() });
+      // Keep cache size bounded (max 100 entries)
+      if (passCache.size > 100) {
+        const oldest = passCache.keys().next().value;
+        if (oldest) passCache.delete(oldest);
+      }
+      
       setPassData(data);
+
+      // Fetch documents and record scan in parallel for speed
+      const fetchPromises: Promise<void>[] = [];
+
+      // Record scan (fire immediately, don't block UI)
+      fetchPromises.push(
+        fetchWithRetry(`${API_URL}/api/scan/${passCode}`, { method: "POST" })
+          .then(async (scanRes) => { if (scanRes.ok) setScanResult(await scanRes.json()); })
+          .catch(() => { /* scan recording is non-critical */ })
+      );
 
       // Fetch Aadhaar if available
       if (data.hasAadhaar) {
-        try {
-          const aadhaarRes = await fetch(`${API_URL}/api/verify/${passCode}/aadhaar`);
-          if (aadhaarRes.ok) {
-            const blob = await aadhaarRes.blob();
-            if (data.aadhaarMimeType === "application/pdf") {
-              await renderPdf(blob, "aadhaar");
-            } else {
-              setAadhaarUrl(URL.createObjectURL(blob));
-            }
-          }
-        } catch {
-          // Aadhaar fetch failed — non-critical
-        }
+        fetchPromises.push(
+          fetchWithRetry(`${API_URL}/api/verify/${passCode}/aadhaar`, {}, 15000)
+            .then(async (aadhaarRes) => {
+              if (aadhaarRes.ok) {
+                const blob = await aadhaarRes.blob();
+                if (data.aadhaarMimeType === "application/pdf") {
+                  await renderPdf(blob, "aadhaar");
+                } else {
+                  setAadhaarUrl(URL.createObjectURL(blob));
+                }
+              }
+            })
+            .catch(() => { /* Aadhaar fetch failed — non-critical */ })
+        );
       }
 
       // Fetch College ID if available
       if (data.hasCollegeId) {
-        try {
-          const collegeIdRes = await fetch(`${API_URL}/api/verify/${passCode}/college-id`);
-          if (collegeIdRes.ok) {
-            const blob = await collegeIdRes.blob();
-            if (data.collegeIdMimeType === "application/pdf") {
-              await renderPdf(blob, "collegeId");
-            } else {
-              setCollegeIdUrl(URL.createObjectURL(blob));
-            }
-          }
-        } catch {
-          // College ID fetch failed — non-critical
-        }
+        fetchPromises.push(
+          fetchWithRetry(`${API_URL}/api/verify/${passCode}/college-id`, {}, 15000)
+            .then(async (collegeIdRes) => {
+              if (collegeIdRes.ok) {
+                const blob = await collegeIdRes.blob();
+                if (data.collegeIdMimeType === "application/pdf") {
+                  await renderPdf(blob, "collegeId");
+                } else {
+                  setCollegeIdUrl(URL.createObjectURL(blob));
+                }
+              }
+            })
+            .catch(() => { /* College ID fetch failed — non-critical */ })
+        );
       }
 
-      // Record scan
-      try {
-        const scanRes = await fetch(`${API_URL}/api/scan/${passCode}`, { method: "POST" });
-        if (scanRes.ok) setScanResult(await scanRes.json());
-      } catch { /* scan recording is non-critical */ }
+      // Don't await — let these load in background while showing result
+      Promise.all(fetchPromises);
 
       setState("result");
-    } catch {
-      setErrorMsg("Network error — check your connection");
+    } catch (err) {
+      const isTimeout = err instanceof Error && err.name === 'AbortError';
+      setErrorMsg(isTimeout ? "Request timed out — server busy, try again" : "Network error — check your connection");
       setState("error");
     }
   }, []);
