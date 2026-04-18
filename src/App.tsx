@@ -46,14 +46,20 @@ async function fetchWithRetry(url: string, options: RequestInit = {}, timeout = 
     const controller = new AbortController();
     const id = setTimeout(() => controller.abort(), timeout);
     try {
-      const response = await fetch(url, { ...options, signal: controller.signal });
+      const response = await fetch(url, { 
+        ...options, 
+        signal: controller.signal,
+        mode: 'cors',
+        credentials: 'omit',
+      });
       clearTimeout(id);
       return response;
     } catch (err) {
       clearTimeout(id);
       lastError = err as Error;
+      console.warn(`Fetch attempt ${i + 1} failed:`, err);
       if (i < retries) {
-        await new Promise(r => setTimeout(r, 500 * (i + 1))); // backoff: 500ms, 1000ms
+        await new Promise(r => setTimeout(r, 1000 * (i + 1))); // backoff: 1s, 2s
       }
     }
   }
@@ -183,8 +189,13 @@ export default function App() {
 
       setState("result");
     } catch (err) {
-      const isTimeout = err instanceof Error && err.name === 'AbortError';
-      setErrorMsg(isTimeout ? "Request timed out — server busy, try again" : "Network error — check your connection");
+      console.error("Fetch error:", err);
+      let msg = "Network error — check WiFi/data connection";
+      if (err instanceof Error) {
+        if (err.name === 'AbortError') msg = "Request timed out — tap Rescan to retry";
+        else if (err.message.includes('Failed to fetch')) msg = "Cannot reach server — check internet connection";
+      }
+      setErrorMsg(msg);
       setState("error");
     }
   }, []);
