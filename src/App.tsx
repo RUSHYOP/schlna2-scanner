@@ -2,7 +2,7 @@ import { useState, useRef, useEffect, useCallback } from "react";
 import { Html5Qrcode } from "html5-qrcode";
 
 const API_URL = import.meta.env.VITE_API_URL || "https://api.saividyafest.live";
-const SCAN_CUTOFF = Date.UTC(2026, 3, 18, 9, 30, 0); // April 18, 2026, 3:00 PM IST
+const SCAN_CUTOFF = Date.UTC(2026, 3, 18, 7, 0, 0); // April 18, 2026, 12:30 PM IST - NOW LIVE
 const CACHE_TTL = 5 * 60 * 1000; // 5 minutes cache for pass data
 const FETCH_TIMEOUT = 15000; // 15 second timeout for API calls (increased for crowd)
 
